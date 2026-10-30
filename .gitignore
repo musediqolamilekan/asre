@@ -1,0 +1,22 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ASRE runtime caches and generated run artifacts
+.repo_cache/
+.asre/
+
+# OS / Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp

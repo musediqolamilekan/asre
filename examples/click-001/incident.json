@@ -1,0 +1,6 @@
+{
+  "id": "click-001",
+  "error": "unexpected command failure",
+  "type": "RuntimeError",
+  "stack": "File \"src/click/core.py\", line 120, in main"
+}

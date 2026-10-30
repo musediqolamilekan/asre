@@ -1,0 +1,11 @@
+{
+  "diagnosis": "Illustrative only: preserve a positive stack-frame offset when the first non-Click caller is located.",
+  "files_to_modify": [
+    "src/click/core.py"
+  ],
+  "unified_diff": "--- a/src/click/core.py\n+++ b/src/click/core.py\n@@ -117,7 +117,7 @@ def _outside_click_stacklevel() -> int:\n         module = frame.f_globals.get(\"__name__\", \"\")\n \n         if module != \"click\" and not module.startswith(\"click.\"):\n-            return level\n+            return max(level, 1)\n \n         frame = frame.f_back\n         level += 1\n",
+  "tests_to_run": [
+    "pytest tests/test_context.py"
+  ],
+  "confidence": 0.1
+}
