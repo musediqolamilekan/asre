@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -280,21 +281,196 @@ def extract_stack_frames(stack_trace: str) -> list[IncidentFrame]:
     return frames
 
 
-def _match_repository_path(frame_path: str, repo_root: str, available_paths: set[str]) -> str | None:
-    normalized = os.path.normpath(frame_path)
-    if os.path.isabs(normalized):
+_WINDOWS_ROOT_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|\\)")
+_JVM_EXTENSIONS = frozenset({".java", ".kt", ".kts", ".scala"})
+_JVM_PREFIX_TOKEN = r"[A-Za-z_][A-Za-z0-9_.$@-]*"
+_JVM_FUNCTION_RE = re.compile(
+    rf"^(?:(?P<prefix>{_JVM_PREFIX_TOKEN}(?:/(?:{_JVM_PREFIX_TOKEN})?)?)/)?(?P<symbol>[A-Za-z_$][A-Za-z0-9_$.$<>-]*)$"
+)
+_JVM_IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+_JVM_METHOD_RE = re.compile(r"^(?:[A-Za-z_$][A-Za-z0-9_$-]*|<init>|<clinit>)$")
+_EXTERNAL_ENV_SEGMENTS = frozenset({
+    ".venv",
+    "venv",
+    "site-packages",
+    "dist-packages",
+    "node_modules",
+    "__pypackages__",
+    ".tox",
+    ".nox",
+    ".eggs",
+})
+_EXTERNAL_CACHE_SUBPATHS = (
+    ".cargo/registry/",
+    ".cargo/git/",
+    "pkg/mod/",
+)
+
+
+def _normalize_relative_posix(raw_path: str) -> str | None:
+    path = raw_path.strip()
+    if not path:
+        return None
+    if os.path.isabs(path) or _WINDOWS_ROOT_RE.match(path):
+        return None
+    posix_path = path.replace("\\", "/")
+    while posix_path.startswith("./"):
+        posix_path = posix_path[2:]
+    normalized = posixpath.normpath(posix_path)
+    if normalized in ("", ".", "..") or normalized.startswith("../") or normalized.startswith("/"):
+        return None
+    return normalized
+
+
+def _is_physically_within_repo(repo_root: str, target_path: str) -> bool:
+    if not repo_root:
+        return True
+    try:
+        real_root = os.path.realpath(repo_root)
+        real_target = os.path.realpath(target_path)
+        return (
+            real_target != real_root
+            and os.path.commonpath([real_target, real_root]) == real_root
+        )
+    except ValueError:
+        return False
+
+
+def _has_external_env_segment(posix_rel_path: str) -> bool:
+    lowered = posix_rel_path.lower()
+    if any(lowered.startswith(prefix) or f"/{prefix}" in lowered for prefix in _EXTERNAL_CACHE_SUBPATHS):
+        return True
+    return any(part in _EXTERNAL_ENV_SEGMENTS for part in lowered.split("/"))
+
+
+def _jvm_qualified_relpath(filename: str, frame_function: str) -> str | None:
+    if "/" in filename or not frame_function:
+        return None
+    file_stem, ext = posixpath.splitext(filename)
+    ext_lower = ext.lower()
+    if not file_stem or ext_lower not in _JVM_EXTENSIONS:
+        return None
+    fn_match = _JVM_FUNCTION_RE.match(frame_function.strip())
+    if not fn_match:
+        return None
+    prefix = fn_match.group("prefix")
+    if prefix and ".." in prefix:
+        return None
+    symbol = fn_match.group("symbol")
+    parts = symbol.split(".")
+    if len(parts) < 3 or any(not part for part in parts):
+        return None
+    package_parts = parts[:-2]
+    class_part = parts[-2]
+    method_part = parts[-1]
+    if not all(_JVM_IDENT_RE.match(pkg) for pkg in package_parts):
+        return None
+    if not _JVM_IDENT_RE.match(class_part) or not _JVM_METHOD_RE.match(method_part):
+        return None
+
+    allowed_stems = {file_stem, f"{file_stem}Kt"} if ext_lower in {".kt", ".kts"} else {file_stem}
+    outer_name = class_part.split("$", 1)[0]
+    if outer_name not in allowed_stems:
+        return None
+
+    return "/".join((*package_parts, filename))
+
+
+def _match_repository_path(
+    frame_path: str,
+    repo_root: str,
+    available_paths: set[str],
+    frame_function: str | None = None,
+) -> str | None:
+    cleaned = _clean_frame_path(frame_path)
+    if not cleaned:
+        return None
+
+    available_by_posix: dict[str, list[str]] = {}
+    for raw_available in available_paths:
+        norm_available = _normalize_relative_posix(raw_available)
+        if norm_available is not None:
+            available_by_posix.setdefault(norm_available, []).append(raw_available)
+
+    def _resolve_unique_candidate(posix_key: str) -> str | None:
+        originals = available_by_posix.get(posix_key)
+        if not originals or len(originals) != 1:
+            return None
+        if repo_root:
+            candidate_fs_path = os.path.join(repo_root, *posix_key.split("/"))
+            if not _is_physically_within_repo(repo_root, candidate_fs_path):
+                return None
+        return originals[0]
+
+    is_windows_rooted = bool(_WINDOWS_ROOT_RE.match(cleaned))
+    if os.path.isabs(cleaned) or is_windows_rooted:
+        if is_windows_rooted and os.name != "nt":
+            return None
+        if not repo_root or not _is_physically_within_repo(repo_root, cleaned):
+            return None
+        real_root = os.path.realpath(repo_root)
         try:
-            relative = os.path.relpath(normalized, repo_root)
+            abs_cleaned = os.path.abspath(cleaned)
+            parent_real = os.path.realpath(os.path.dirname(abs_cleaned))
+            lexical_in_real_parent = os.path.join(parent_real, os.path.basename(abs_cleaned))
+            if (
+                lexical_in_real_parent != real_root
+                and os.path.commonpath([lexical_in_real_parent, real_root]) == real_root
+            ):
+                parent_rel = _normalize_relative_posix(
+                    os.path.relpath(lexical_in_real_parent, real_root)
+                )
+                if parent_rel is not None and parent_rel in available_by_posix:
+                    return _resolve_unique_candidate(parent_rel)
         except ValueError:
             return None
-        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        try:
+            real_frame = os.path.realpath(cleaned)
+            real_rel = _normalize_relative_posix(os.path.relpath(real_frame, real_root))
+        except ValueError:
             return None
-        normalized = relative
-    normalized = normalized.lstrip("./")
-    if normalized in available_paths:
-        return normalized
-    matches = [path for path in available_paths if path.endswith(os.sep + normalized) or normalized.endswith(os.sep + path)]
-    return matches[0] if len(matches) == 1 else None
+        if real_rel is not None and real_rel in available_by_posix:
+            return _resolve_unique_candidate(real_rel)
+        return None
+
+    normalized = _normalize_relative_posix(cleaned)
+    if normalized is None:
+        return None
+
+    if normalized in available_by_posix:
+        return _resolve_unique_candidate(normalized)
+
+    if repo_root:
+        repo_names = (
+            os.path.basename(os.path.normpath(os.path.abspath(repo_root))),
+            os.path.basename(os.path.normpath(os.path.realpath(repo_root))),
+        )
+        for repo_name in dict.fromkeys(repo_names):
+            if repo_name and normalized.startswith(repo_name + "/"):
+                without_repo_prefix = normalized[len(repo_name) + 1 :]
+                if without_repo_prefix in available_by_posix:
+                    return _resolve_unique_candidate(without_repo_prefix)
+
+    if _has_external_env_segment(normalized):
+        return None
+
+    if "/" in normalized:
+        candidate = normalized
+    elif frame_function:
+        candidate = _jvm_qualified_relpath(normalized, frame_function)
+        if candidate is None:
+            return None
+    else:
+        return None
+
+    matched_keys = [
+        posix_key
+        for posix_key in available_by_posix
+        if posix_key == candidate or posix_key.endswith("/" + candidate)
+    ]
+    if len(matched_keys) != 1:
+        return None
+    return _resolve_unique_candidate(matched_keys[0])
 
 
 def _graph_distances(graph: DependencyGraph, origins: set[str], maximum_distance: int) -> dict[str, int]:
@@ -340,7 +516,7 @@ def build_repair_context(
     mapped: dict[str, list[int]] = {}
     unmapped: list[IncidentFrame] = []
     for frame in extract_stack_frames(incident.stack_trace):
-        path = _match_repository_path(frame.path, repo_root, available_paths)
+        path = _match_repository_path(frame.path, repo_root, available_paths, frame.function)
         if path is None:
             unmapped.append(frame)
         else:
